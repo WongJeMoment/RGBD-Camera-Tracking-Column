@@ -5,7 +5,8 @@ import pyrealsense2 as rs
 
 from ProcessFrame import process_frame
 from config import COLOR_INTRINSICS
-from Vision import *
+from Vision import *   # assumes project_point_to_pixel exists
+
 
 class RealSenseCylinderRunner:
     def __init__(self,
@@ -42,8 +43,12 @@ class RealSenseCylinderRunner:
         # cache last result
         self.last_cyl = None
 
+        # tracking toggle (press 'p')
+        self.tracking_on = False
+
         print(f"[INFO] Depth scale: {self.depth_scale:.12f} m/LSB")
-        print(f"[INFO] Press 'p' to run process_frame() on current frame.")
+        print(f"[INFO] Press 'p' to toggle continuous tracking on/off.")
+        print(f"[INFO] Press 's' to save rgb/depth.")
         print(f"[INFO] Press 'q' or ESC to quit. Press 'c' to clear click.\n")
 
     def close(self):
@@ -63,19 +68,20 @@ class RealSenseCylinderRunner:
         if event == cv2.EVENT_LBUTTONDOWN:
             self.click_xy = (x, y)
 
-    def _draw_overlay(self, color_image, depth_frame, depth_m):
+    def _draw_overlay(self, color_image, depth_frame):
         self._update_fps()
         h, w = color_image.shape[:2]
 
-        # Use principal point from config for center query
+        # principal point from config
         cx_cfg = int(round(COLOR_INTRINSICS.cx))
         cy_cfg = int(round(COLOR_INTRINSICS.cy))
         cx_cfg = int(np.clip(cx_cfg, 0, w - 1))
         cy_cfg = int(np.clip(cy_cfg, 0, h - 1))
+
         center_depth = depth_frame.get_distance(cx_cfg, cy_cfg)
 
-
         # Click depth
+        click_depth = None
         if self.click_xy is not None:
             x, y = self.click_xy
             if 0 <= x < w and 0 <= y < h:
@@ -87,16 +93,47 @@ class RealSenseCylinderRunner:
         cv2.drawMarker(color_image, (cx_cfg, cy_cfg), (255, 255, 255),
                        markerType=cv2.MARKER_CROSS, markerSize=15, thickness=2)
 
-        # Draw last cylinder result (text only)
+        # Text overlay
+        y0 = 25
+        dy = 22
+
+        cv2.putText(color_image, f"FPS: {self._fps:.1f}", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        y0 += dy
+
+        cv2.putText(color_image, f"Tracking: {'ON' if self.tracking_on else 'OFF'} (press p)", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        y0 += dy
+
+        cv2.putText(color_image, f"Center depth: {center_depth:.3f} m", (10, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        y0 += dy
+
+        if click_depth is not None:
+            cv2.putText(color_image, f"Click depth: {click_depth:.3f} m", (10, y0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+            y0 += dy
+
+        # Show last cylinder stats (text only)
         if self.last_cyl is not None:
-            v = self.last_cyl.get("axis_dir", None)
-            bc = self.last_cyl.get("base_center", None)
             r = self.last_cyl.get("radius", None)
             ir = self.last_cyl.get("inlier_ratio", None)
+            bc = self.last_cyl.get("base_center", None)
 
+            if r is not None:
+                cv2.putText(color_image, f"Radius: {float(r):.4f}", (10, y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                y0 += dy
+            if ir is not None:
+                cv2.putText(color_image, f"Inlier ratio: {float(ir):.3f}", (10, y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                y0 += dy
+            if bc is not None:
+                bc = np.asarray(bc).reshape(3)
+                cv2.putText(color_image, f"Base center: [{bc[0]:.3f}, {bc[1]:.3f}, {bc[2]:.3f}]", (10, y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+                y0 += dy
 
-        # Put text
-        y0 = 25
         return color_image
 
     def run(self):
@@ -125,10 +162,19 @@ class RealSenseCylinderRunner:
                 depth_vis_u8 = (depth_vis / self.max_disp_m * 255.0).astype(np.uint8)
                 depth_colormap = cv2.applyColorMap(depth_vis_u8, cv2.COLORMAP_JET)
 
+                # --- Continuous tracking update (toggle by 'p') ---
+                if self.tracking_on:
+                    result = process_frame(depth_m, color_image, COLOR_INTRINSICS)
+                    if result is None or result.get("cylinder", None) is None:
+                        self.last_cyl = None
+                    else:
+                        self.last_cyl = result["cylinder"]
+
                 # overlay
                 color_disp = color_image.copy()
-                color_disp = self._draw_overlay(color_disp, depth_frame, depth_m)
+                color_disp = self._draw_overlay(color_disp, depth_frame)
 
+                # draw last cylinder base center as a point on RGB
                 if self.last_cyl is not None and self.last_cyl.get("base_center", None) is not None:
                     base_center = np.asarray(self.last_cyl["base_center"], dtype=np.float64).reshape(3)
                     uv = project_point_to_pixel(base_center, COLOR_INTRINSICS)
@@ -160,12 +206,8 @@ class RealSenseCylinderRunner:
                     cv2.imwrite(f"depth_color_{ts}.png", depth_colormap)
                     print(f"[SAVE] rgb/depth saved with timestamp {ts}")
                 elif key == ord('p'):
-                    # 只更新一次圆柱结果（中心点），不做任何可视化弹窗/打印
-                    result = process_frame(depth_m, color_image, COLOR_INTRINSICS)
-                    if result is None or result.get("cylinder", None) is None:
-                        self.last_cyl = None
-                    else:
-                        self.last_cyl = result["cylinder"]
+                    self.tracking_on = not self.tracking_on
+                    print(f"[TRACK] tracking_on = {self.tracking_on}")
 
         finally:
             self.close()

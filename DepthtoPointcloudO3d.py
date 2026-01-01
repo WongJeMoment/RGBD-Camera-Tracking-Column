@@ -29,7 +29,7 @@ def depth_to_pointcloud_o3d(depth_m: np.ndarray, color_bgr: np.ndarray, intr, de
 
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, pinhole)
 
-    # 过滤 depth_min
+    # 二次深度过滤
     pts = np.asarray(pcd.points)
     z = pts[:, 2]
     mask = (z > depth_min) & (z < depth_max) & np.isfinite(z)
