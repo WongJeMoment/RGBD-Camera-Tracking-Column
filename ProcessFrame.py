@@ -1,11 +1,15 @@
 import cv2
 import numpy as np
+import open3d as o3d
 
 from DbscanClusters import dbscan_clusters
 from DepthtoPointcloudO3d import depth_to_pointcloud_o3d
 from SegmentTablePlane import segment_table_plane
 from FitCylinderPca import fit_cylinder_pca
-from DrawClusteronDepth import *
+from DrawClusteronDepth import project_points_to_image
+
+_TB_INIT = False
+_TB_WIN = "HSV Params"
 
 def filter_white_points_range(pcd, v_min=180, v_max=255, s_min=0, s_max=40, min_keep=50):
     """
@@ -32,92 +36,150 @@ def filter_white_points_range(pcd, v_min=180, v_max=255, s_min=0, s_max=40, min_
     return pcd.select_by_index(idx)
 
 
-def _debug_show_filtered_rgb(color_bgr,
-                             v_min=180, v_max=255,
-                             s_min=0,   s_max=40,
-                             win="Filtered RGB (white)"):
-    """
-    显示基于 HSV 阈值过滤后的图像（像素级）：
-      v_min<=V<=v_max 且 s_min<=S<=s_max
-    左：mask；右：过滤后的彩色图
-    """
-    if color_bgr is None or color_bgr.size == 0:
-        return
-
-    hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
-    s = hsv[:, :, 1]
-    v = hsv[:, :, 2]
-
-    mask = ((v >= v_min) & (v <= v_max) & (s >= s_min) & (s <= s_max)).astype(np.uint8) * 255
-    filtered_bgr = cv2.bitwise_and(color_bgr, color_bgr, mask=mask)
-
-    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    vis = np.hstack((mask_bgr, filtered_bgr))
-
-    cv2.putText(vis, f"V:[{v_min},{v_max}]  S:[{s_min},{s_max}]",
-                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9,
-                (255, 255, 255), 2, cv2.LINE_AA)
-
-    cv2.imshow(win, vis)
-    cv2.waitKey(1)
-
-
 def process_frame(depth_m, color_bgr, intr_color):
-    # ====== 白色阈值：你可以在这里改（最小改动点）======
-    # 你原先写的是 v_min=60, s_max=20，这里我给你完整上下限
-    v_min, v_max = 120, 180
-    s_min, s_max = 0, 40
-    # ===================================================
+    """
+    不弹任何额外窗口（不 cv2.imshow），只返回结果给 main 画。
+    返回 dict:
+      bbox_uv: (u0,v0,u1,v1) or None
+      bbox_xyz: (3,) or None
+      cylinder: fit dict or None
+    """
+    # ====== 参数区 ======
+    global _TB_INIT, _TB_WIN
 
-    # ✅ 0) 可视化：过滤后的RGB（像素级）
-    _debug_show_filtered_rgb(color_bgr,
-                             v_min=v_min, v_max=v_max,
-                             s_min=s_min, s_max=s_max)
+    # ====== 参数区（默认值）======
+    default_v_min, default_v_max = 120, 198
+    default_s_min, default_s_max = 8, 39
+    # ============================
 
-    # 1) 点云
+    # ✅ 只初始化一次 trackbar
+    if not _TB_INIT:
+        cv2.namedWindow(_TB_WIN, cv2.WINDOW_NORMAL)
+        cv2.createTrackbar("V_min", _TB_WIN, default_v_min, 255, lambda x: None)
+        cv2.createTrackbar("V_max", _TB_WIN, default_v_max, 255, lambda x: None)
+        cv2.createTrackbar("S_min", _TB_WIN, default_s_min, 255, lambda x: None)
+        cv2.createTrackbar("S_max", _TB_WIN, default_s_max, 255, lambda x: None)
+        _TB_INIT = True
+
+    # ✅ 每帧读取当前条的值
+    v_min = cv2.getTrackbarPos("V_min", _TB_WIN)
+    v_max = cv2.getTrackbarPos("V_max", _TB_WIN)
+    s_min = cv2.getTrackbarPos("S_min", _TB_WIN)
+    s_max = cv2.getTrackbarPos("S_max", _TB_WIN)
+
+    # 防呆：保证 min <= max
+    if v_min > v_max:
+        v_min, v_max = v_max, v_min
+    if s_min > s_max:
+        s_min, s_max = s_max, s_min
+
+    min_hd_ratio, max_hd_ratio = 1, 6
+    inlier_rad_tol = 0.01
+    # ====================
+
+    # 1) 深度 -> 点云（带颜色）
     pcd = depth_to_pointcloud_o3d(depth_m, color_bgr, intr_color,
                                   depth_min=0.15, depth_max=1.5)
 
-    # 可选：降采样 + 去离群（强烈建议）
+    # 降采样 + 去离群
     pcd = pcd.voxel_down_sample(voxel_size=0.005)
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
 
-    # 2) 桌面平面
+    # 2) 分割桌面
     plane_model, table, remain = segment_table_plane(
         pcd, distance_threshold=0.005, num_iterations=2000
     )
 
-    # ✅ 2.5) 点云色彩过滤（HSV区间）
-    remain = filter_white_points_range(remain,
-                                       v_min=v_min, v_max=v_max,
-                                       s_min=s_min, s_max=s_max,
-                                       min_keep=80)
+    # 3) 白色/低饱和过滤（点云颜色）
+    remain = filter_white_points_range(
+        remain, v_min=v_min, v_max=v_max, s_min=s_min, s_max=s_max, min_keep=80
+    )
 
-    # 3) 聚类
+    # ======= ✅ HSV过滤可视化：像素级保留原RGB，其余全黑（最直观） =======
+    hsv = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2HSV)
+    s_img = hsv[:, :, 1]
+    v_img = hsv[:, :, 2]
+
+    mask = ((v_img >= v_min) & (v_img <= v_max) & (s_img >= s_min) & (s_img <= s_max)).astype(np.uint8) * 255
+    hsv_vis = cv2.bitwise_and(color_bgr, color_bgr, mask=mask)
+
+    cv2.namedWindow("HSV Filter Visualization", cv2.WINDOW_NORMAL)
+    cv2.imshow("HSV Filter Visualization", hsv_vis)
+    cv2.waitKey(1)
+    # =====================================================================
+
+    # 4) 聚类
     clusters = dbscan_clusters(remain, eps=0.02, min_points=60, min_cluster_size=150)
-
-    # 4) 对最大簇拟合圆柱（你也可以遍历所有簇）
-    # 4) 对最大簇拟合圆柱
     if not clusters:
-        return None
+        return {
+            "cylinder": None,
+            "target_cluster": None,
+            "bbox_uv": None,
+            "bbox_center_uv": None,
+            "bbox_xyz": None,
+            "plane_model": plane_model
+        }
 
-    target = clusters[0]
-    fit = fit_cylinder_pca(target, plane_model=plane_model, inlier_rad_tol=0.01)
+    # 5) 遍历簇，找第一个通过 H/D 过滤的圆柱
+    best_fit = None
+    best_cluster = None
 
-    # ✅ 4.5) 把聚类（圆柱体点云）投影回深度图并显示
-    # target.points 是相机坐标系下的 xyz（通常 depth_to_pointcloud_o3d 就是用相机坐标生成的）
+    for c in clusters:
+        fit = fit_cylinder_pca(
+            c,
+            plane_model=plane_model,
+            inlier_rad_tol=inlier_rad_tol,
+            min_hd_ratio=min_hd_ratio,
+            max_hd_ratio=max_hd_ratio,
+            use_inliers_for_height=True
+        )
+        if fit is not None:
+            best_fit = fit
+            best_cluster = c
+            break
+
+    if best_fit is None or best_cluster is None:
+        return {
+            "cylinder": None,
+            "target_cluster": None,
+            "bbox_uv": None,
+            "bbox_center_uv": None,
+            "bbox_xyz": None,
+            "plane_model": plane_model
+        }
+
+    # 6) 计算 bbox（在 aligned 图像坐标系下）
     uv = project_points_to_image(
-        np.asarray(target.points),
+        np.asarray(best_cluster.points),
         intr_color=intr_color,
         img_shape_hw=depth_m.shape[:2]
     )
-    draw_cluster_on_depth(depth_m, uv, win="Depth + Cylinder Cluster")
+
+    bbox = None
+    bbox_center_uv = None
+    if uv is not None and len(uv) > 0:
+        u = uv[:, 0].astype(np.int32)
+        v = uv[:, 1].astype(np.int32)
+
+        # 用百分位裁剪更稳（比 min/max 不容易被离群点拖大）
+        u0, u1 = np.percentile(u, [2, 98]).astype(int)
+        v0, v1 = np.percentile(v, [2, 98]).astype(int)
+
+        bbox = (int(u0), int(v0), int(u1), int(v1))
+        bbox_center_uv = (int((u0 + u1) * 0.5), int((v0 + v1) * 0.5))
+
+    # 7) bbox 对应的 XYZ（推荐：优先用 base_center；否则用簇中心）
+    xyz = None
+    if best_fit.get("base_center", None) is not None:
+        xyz = np.asarray(best_fit["base_center"], dtype=np.float64).reshape(3)
+    else:
+        xyz = np.asarray(best_cluster.points).mean(axis=0).astype(np.float64)
 
     return {
-        "pcd": pcd,
-        "table": table,
-        "remain": remain,
-        "clusters": clusters,
-        "plane_model": plane_model,
-        "cylinder": fit
+        "cylinder": best_fit,
+        "target_cluster": best_cluster,
+        "bbox_uv": bbox,
+        "bbox_center_uv": bbox_center_uv,
+        "bbox_xyz": xyz,
+        "plane_model": plane_model
     }
