@@ -3,6 +3,11 @@ import numpy as np
 import cv2
 import pyrealsense2 as rs
 
+# ===== ROS2 publish =====
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped  # 推荐用 PoseStamped
+
 from config import COLOR_INTRINSICS
 from ProcessFrame import process_frame  # 你刚刚给的 process_frame
 
@@ -35,25 +40,62 @@ def draw_bbox_and_xyz(img, bbox, xyz, label="CYL", color=(0, 255, 255)):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
 
 
+class PosePublisher(Node):
+    """ROS2 Node: publish PoseStamped (xyz + quat 0,0,0,1)."""
+
+    def __init__(self,
+                 topic_name="/target_pose_stamped",
+                 frame_id="base_link"):
+        super().__init__("realsense_cylinder_pose_pub")
+        self.pub = self.create_publisher(PoseStamped, topic_name, 10)
+        self.frame_id = frame_id
+
+    def publish_xyz_quat(self, xyz, quat=(0.0, 0.0, 0.0, 1.0)):
+        if xyz is None:
+            return
+
+        msg = PoseStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_id
+
+        msg.pose.position.x = float(xyz[0])
+        msg.pose.position.y = float(xyz[1])
+        msg.pose.position.z = float(xyz[2])
+
+        msg.pose.orientation.x = float(quat[0])
+        msg.pose.orientation.y = float(quat[1])
+        msg.pose.orientation.z = float(quat[2])
+        msg.pose.orientation.w = float(quat[3])
+
+        self.pub.publish(msg)
+
+
 class RealSenseCylinderContinuous:
     def __init__(self,
+                 ros_node: PosePublisher,
                  rgb_size=(640, 480),
                  depth_size=(640, 480),
                  fps=30,
                  align_to_color=True,
                  max_disp_m=3.0,
-                 run_every_n=1):
+                 run_every_n=1,
+                 publish_every_n=1):
         """
         run_every_n:
-          1 = 每帧都跑 process_frame（最实时，最吃CPU）
-          2/3 = 每2/3帧跑一次，其余帧复用上次bbox（更流畅）
+          1 = 每帧都跑 process_frame
+        publish_every_n:
+          1 = 每帧都发布pose
+          2/3 = 每2/3帧发布一次（减轻DDS/ROS通信压力）
         """
+        self.ros_node = ros_node
+
         self.rgb_w, self.rgb_h = rgb_size
         self.dep_w, self.dep_h = depth_size
         self.fps = fps
         self.align_to_color = align_to_color
         self.max_disp_m = max_disp_m
         self.run_every_n = max(1, int(run_every_n))
+        self.publish_every_n = max(1, int(publish_every_n))
 
         self.pipeline = rs.pipeline()
         cfg = rs.config()
@@ -78,7 +120,7 @@ class RealSenseCylinderContinuous:
         self._frame_idx = 0
 
         print(f"[INFO] Depth scale: {self.depth_scale:.12f} m/LSB")
-        print("[INFO] Continuous output ON (bbox + xyz). Press 'q' or ESC to quit.")
+        print("[INFO] Continuous output ON (bbox + xyz + ROS2 publish). Press 'q' or ESC to quit.")
 
     def close(self):
         try:
@@ -97,7 +139,7 @@ class RealSenseCylinderContinuous:
         cv2.namedWindow("RGB | Depth", cv2.WINDOW_NORMAL)
 
         try:
-            while True:
+            while rclpy.ok():
                 frames = self.pipeline.wait_for_frames()
                 if self.align is not None:
                     frames = self.align.process(frames)
@@ -105,14 +147,16 @@ class RealSenseCylinderContinuous:
                 depth_frame = frames.get_depth_frame()
                 color_frame = frames.get_color_frame()
                 if not depth_frame or not color_frame:
+                    rclpy.spin_once(self.ros_node, timeout_sec=0.0)
                     continue
 
                 color_bgr = np.asanyarray(color_frame.get_data())
                 depth_u16 = np.asanyarray(depth_frame.get_data())
                 depth_m = depth_u16.astype(np.float32) * self.depth_scale
 
-                # -------- 每 run_every_n 帧跑一次检测，其余帧复用上次结果 --------
                 self._frame_idx += 1
+
+                # ---- 检测 ----
                 if (self._frame_idx % self.run_every_n) == 0:
                     result = process_frame(depth_m, color_bgr, COLOR_INTRINSICS)
 
@@ -121,36 +165,28 @@ class RealSenseCylinderContinuous:
                         self.last_xyz = result.get("bbox_xyz", None)
                         self.last_fit = result.get("cylinder", None)
                     else:
-                        # 没检测到就清掉（如果你希望“保持上一次框不消失”，把这三行注释掉）
                         self.last_bbox = None
                         self.last_xyz = None
                         self.last_fit = None
-                # ----------------------------------------------------------------
 
-                # display images (only RGB + Depth)
+                # ---- 发布 PoseStamped：xyz + quat(0,0,0,1) ----
+                if self.last_xyz is not None and (self._frame_idx % self.publish_every_n) == 0:
+                    self.ros_node.publish_xyz_quat(self.last_xyz, quat=(0.0, 0.0, 0.0, 1.0))
+
+                # 让 ROS2 node 处理内部事件（timer / pub buffer）
+                rclpy.spin_once(self.ros_node, timeout_sec=0.0)
+
+                # ---- 可视化 ----
                 self._update_fps()
                 rgb_disp = color_bgr.copy()
                 depth_disp = depth_to_colormap(depth_m, max_disp_m=self.max_disp_m)
 
-                # 在两边都画 bbox + xyz（持续输出）
                 draw_bbox_and_xyz(rgb_disp, self.last_bbox, self.last_xyz, label="CYL", color=(0, 255, 255))
                 draw_bbox_and_xyz(depth_disp, self.last_bbox, self.last_xyz, label="CYL", color=(0, 255, 255))
 
-                # overlay fps / status
-                cv2.putText(rgb_disp, f"FPS: {self._fps:.1f}  run_every_n={self.run_every_n}",
+                cv2.putText(rgb_disp, f"FPS: {self._fps:.1f}  run_every_n={self.run_every_n}  pub_every_n={self.publish_every_n}",
                             (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (255, 255, 255), 2, cv2.LINE_AA)
-                if self.last_fit is not None:
-                    ir = self.last_fit.get("inlier_ratio", None)
-                    hd = self.last_fit.get("hd_ratio", None)
-                    if ir is not None:
-                        cv2.putText(rgb_disp, f"inlier: {float(ir):.2f}",
-                                    (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    (255, 255, 255), 2, cv2.LINE_AA)
-                    if hd is not None:
-                        cv2.putText(rgb_disp, f"H/D: {float(hd):.2f}",
-                                    (10, 82), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    (255, 255, 255), 2, cv2.LINE_AA)
 
                 # size match then show
                 if depth_disp.shape[:2] != rgb_disp.shape[:2]:
@@ -170,12 +206,25 @@ class RealSenseCylinderContinuous:
 
 
 if __name__ == "__main__":
+    # ===== init ROS2 =====
+    rclpy.init()
+
+    # 你可以改 topic / frame_id
+    node = PosePublisher(topic_name="/target_pose_stamped", frame_id="base_link")
+
     runner = RealSenseCylinderContinuous(
+        ros_node=node,
         rgb_size=(640, 480),
         depth_size=(640, 480),
         fps=30,
         align_to_color=True,
         max_disp_m=3.0,
-        run_every_n=1  # 如果卡顿，把它改成 2 或 3
+        run_every_n=1,        # 检测频率
+        publish_every_n=1     # 发布频率（卡顿就改 2 或 3）
     )
-    runner.run()
+
+    try:
+        runner.run()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
